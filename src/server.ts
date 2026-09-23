@@ -54,6 +54,17 @@ function normalizeShipping(shipping: ShippingRequest | undefined): { method: Del
   return { method, zone: method === 'national' ? 'Nacional' : 'Comarca Lagunera', amountMxn, address };
 }
 
+function optionalUserId(request: express.Request): number | null {
+  const token = request.header('authorization')?.replace(/^Bearer\s+/i, '');
+  try {
+    const claims = token ? jwt.verify(token, jwtSecret) as { sub?: string | number } : null;
+    const userId = Number(claims?.sub);
+    return Number.isInteger(userId) && userId > 0 ? userId : null;
+  } catch {
+    return null;
+  }
+}
+
 const allowedOrigins = new Set([clientUrl, 'http://localhost:4300', 'http://127.0.0.1:4300']);
 
 app.use((request, response, next) => {
@@ -237,10 +248,11 @@ app.post('/api/orders', async (request, response) => {
     return;
   }
   const shipping = normalizeShipping(shippingRequest);
+  const userId = optionalUserId(request);
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
-    const [orderResult] = await connection.execute<mysql.ResultSetHeader>('INSERT INTO orders (stripe_payment_intent_id, payment_mode, amount_mxn, shipping_amount_mxn, delivery_method, shipping_zone, recipient_name, recipient_phone, address_line, city, state, postal_code, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [stripePaymentIntentId, paymentMode, Number(amountMxn ?? paymentIntent.amount / 100), shipping.amountMxn, shipping.method, shipping.zone, shipping.address.name ?? '', shipping.address.phone ?? '', shipping.address.line1 ?? '', shipping.address.city ?? '', shipping.address.state ?? '', shipping.address.postalCode ?? '', 'paid']);
+    const [orderResult] = await connection.execute<mysql.ResultSetHeader>('INSERT INTO orders (user_id, stripe_payment_intent_id, payment_mode, amount_mxn, shipping_amount_mxn, delivery_method, shipping_zone, recipient_name, recipient_phone, address_line, city, state, postal_code, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [userId, stripePaymentIntentId, paymentMode, Number(amountMxn ?? paymentIntent.amount / 100), shipping.amountMxn, shipping.method, shipping.zone, shipping.address.name ?? '', shipping.address.phone ?? '', shipping.address.line1 ?? '', shipping.address.city ?? '', shipping.address.state ?? '', shipping.address.postalCode ?? '', 'paid']);
     for (const item of items) {
       const product = item.productId ? catalogPrices[item.productId] : undefined;
       if (!product) throw new Error('PRODUCT_UNAVAILABLE');
@@ -260,6 +272,24 @@ app.post('/api/orders', async (request, response) => {
   } finally {
     connection.release();
   }
+});
+
+app.get('/api/orders', async (request, response) => {
+  if (!db) {
+    response.status(503).json({ ok: false, code: 'DATABASE_NOT_CONFIGURED', message: 'MySQL todavía no está configurado.' });
+    return;
+  }
+  const userId = optionalUserId(request);
+  if (!userId) {
+    response.status(401).json({ ok: false, code: 'AUTH_REQUIRED', message: 'Inicia sesión para consultar tus pedidos de cuenta.' });
+    return;
+  }
+  const [orders] = await db.execute<mysql.RowDataPacket[]>('SELECT id, stripe_payment_intent_id, payment_mode, amount_mxn, shipping_amount_mxn, delivery_method, shipping_zone, recipient_name, recipient_phone, address_line, city, state, postal_code, carrier, tracking_number, tracking_url, shipping_status, status, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', [userId]);
+  const orderIds = orders.map((order) => Number(order.id)).filter((id) => Number.isInteger(id) && id > 0);
+  const [items] = orderIds.length
+    ? await db.execute<mysql.RowDataPacket[]>('SELECT order_id, product_id, quantity, unit_amount_mxn FROM order_items WHERE order_id IN (?) ORDER BY id ASC', [orderIds])
+    : [[] as mysql.RowDataPacket[]];
+  response.json({ ok: true, orders, items });
 });
 
 function requireAdmin(request: express.Request, response: express.Response, next: express.NextFunction): void {
