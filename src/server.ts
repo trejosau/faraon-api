@@ -35,6 +35,24 @@ const catalogPrices: Record<string, { name: string; cash: number; credit: number
   'sala-esquinera': { name: 'Sala tipo escuadra', cash: 14500, credit: 18500 },
   'comedor-100': { name: 'Comedor compacto', cash: 8900, credit: 8900 }
 };
+const catalogStock: Record<string, number> = {
+  'comedor-160': 2,
+  'sala-modular': 1,
+  bufetero: 3,
+  'comedor-180': 0,
+  'sala-esquinera': 2,
+  'comedor-100': 4
+};
+
+type DeliveryMethod = 'local' | 'national';
+type ShippingRequest = { method?: DeliveryMethod; zone?: string; amountMxn?: number; address?: { name?: string; phone?: string; line1?: string; city?: string; state?: string; postalCode?: string } };
+
+function normalizeShipping(shipping: ShippingRequest | undefined): { method: DeliveryMethod; zone: string; amountMxn: number; address: NonNullable<ShippingRequest['address']> } {
+  const address = shipping?.address ?? {};
+  const method = shipping?.method === 'national' ? 'national' : 'local';
+  const amountMxn = Math.max(0, Math.round(Number(shipping?.amountMxn ?? 0)));
+  return { method, zone: method === 'national' ? 'Nacional' : 'Comarca Lagunera', amountMxn, address };
+}
 
 const allowedOrigins = new Set([clientUrl, 'http://localhost:4300', 'http://127.0.0.1:4300']);
 
@@ -54,7 +72,7 @@ const corsOptions = {
     callback(new Error('CORS_ORIGIN_NOT_ALLOWED'));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-Id']
 };
 
@@ -149,7 +167,7 @@ app.post('/api/auth/reset-password', async (request, response) => {
 });
 
 app.post('/api/checkout/create-payment-intent', async (request, response) => {
-  const { paymentMode, items } = request.body as { paymentMode?: 'cash' | 'credit'; items?: Array<{ productId?: string; quantity?: number }> };
+  const { paymentMode, items, shipping: shippingRequest, installmentMonths } = request.body as { paymentMode?: 'cash' | 'credit'; items?: Array<{ productId?: string; quantity?: number }>; shipping?: ShippingRequest; installmentMonths?: 3 | 6 | null };
   if (!stripe) {
     response.status(503).json({ ok: false, code: 'STRIPE_NOT_CONFIGURED', requestId: response.locals.requestId, message: 'Stripe todavía no está configurado en la API.' });
     return;
@@ -160,6 +178,7 @@ app.post('/api/checkout/create-payment-intent', async (request, response) => {
   }
 
   const mode = paymentMode;
+  const shipping = normalizeShipping(shippingRequest);
   let amount = 0;
   for (const item of items) {
     const product = item.productId ? catalogPrices[item.productId] : undefined;
@@ -168,9 +187,14 @@ app.post('/api/checkout/create-payment-intent', async (request, response) => {
       response.status(400).json({ ok: false, code: 'PRODUCT_UNAVAILABLE', requestId: response.locals.requestId, message: 'Una de las piezas ya no está disponible.' });
       return;
     }
+    if (quantity > (catalogStock[item.productId as string] ?? 0)) {
+      response.status(409).json({ ok: false, code: 'INSUFFICIENT_STOCK', requestId: response.locals.requestId, message: `No hay suficientes unidades de ${product.name}.` });
+      return;
+    }
     amount += (mode === 'cash' ? product.cash : product.credit) * quantity * 100;
   }
 
+  amount += shipping.amountMxn * 100;
   const paymentIntent = await stripe.paymentIntents.create({
     amount,
     currency: 'mxn',
@@ -180,15 +204,62 @@ app.post('/api/checkout/create-payment-intent', async (request, response) => {
         installments: { enabled: mode === 'credit' }
       }
     },
-    metadata: { paymentMode: mode }
+    shipping: {
+      name: shipping.address.name ?? 'Cliente El Faraón',
+      phone: shipping.address.phone,
+      address: { line1: shipping.address.line1 ?? '', city: shipping.address.city ?? '', state: shipping.address.state ?? '', postal_code: shipping.address.postalCode ?? '', country: 'MX' }
+    },
+    metadata: { paymentMode: mode, installmentMonths: String(installmentMonths ?? ''), deliveryMethod: shipping.method, shippingZone: shipping.zone, shippingAmountMxn: String(shipping.amountMxn) }
   });
 
   response.json({
     ok: true,
     clientSecret: paymentIntent.client_secret,
+    paymentIntentId: paymentIntent.id,
     amount: amount / 100,
     message: mode === 'credit' ? 'Stripe mostrará los meses disponibles para tu tarjeta.' : 'Pago contado listo para confirmar con tarjeta.'
   });
+});
+
+app.post('/api/orders', async (request, response) => {
+  const { stripePaymentIntentId, paymentMode, installmentMonths, amountMxn, items, shipping: shippingRequest } = request.body as { stripePaymentIntentId?: string; paymentMode?: 'cash' | 'credit'; installmentMonths?: 3 | 6 | null; amountMxn?: number; items?: Array<{ productId?: string; quantity?: number }>; shipping?: ShippingRequest };
+  if (!db) {
+    response.status(503).json({ ok: false, code: 'DATABASE_NOT_CONFIGURED', message: 'El pago fue recibido, pero MySQL todavía no está configurado para guardar el pedido.' });
+    return;
+  }
+  if (!stripe || !stripePaymentIntentId || !items?.length || (paymentMode !== 'cash' && paymentMode !== 'credit')) {
+    response.status(400).json({ ok: false, code: 'ORDER_INPUT_INVALID', message: 'Faltan datos para registrar el pedido.' });
+    return;
+  }
+  const paymentIntent = await stripe.paymentIntents.retrieve(stripePaymentIntentId);
+  if (paymentIntent.status !== 'succeeded' && paymentIntent.status !== 'processing') {
+    response.status(409).json({ ok: false, code: 'PAYMENT_NOT_CONFIRMED', message: 'El pago todavía no está confirmado.' });
+    return;
+  }
+  const shipping = normalizeShipping(shippingRequest);
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [orderResult] = await connection.execute<mysql.ResultSetHeader>('INSERT INTO orders (stripe_payment_intent_id, payment_mode, amount_mxn, shipping_amount_mxn, delivery_method, shipping_zone, recipient_name, recipient_phone, address_line, city, state, postal_code, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [stripePaymentIntentId, paymentMode, Number(amountMxn ?? paymentIntent.amount / 100), shipping.amountMxn, shipping.method, shipping.zone, shipping.address.name ?? '', shipping.address.phone ?? '', shipping.address.line1 ?? '', shipping.address.city ?? '', shipping.address.state ?? '', shipping.address.postalCode ?? '', 'paid']);
+    for (const item of items) {
+      const product = item.productId ? catalogPrices[item.productId] : undefined;
+      if (!product) throw new Error('PRODUCT_UNAVAILABLE');
+      const quantity = Math.max(1, Math.min(Number(item.quantity ?? 1), 20));
+      if (quantity > (catalogStock[item.productId as string] ?? 0)) throw new Error('INSUFFICIENT_STOCK');
+      await connection.execute('INSERT INTO order_items (order_id, product_id, quantity, unit_amount_mxn) VALUES (?, ?, ?, ?)', [orderResult.insertId, item.productId as string, quantity, paymentMode === 'cash' ? product.cash : product.credit]);
+    }
+    await connection.commit();
+    for (const item of items) {
+      const productId = item.productId as string;
+      catalogStock[productId] -= Math.max(1, Math.min(Number(item.quantity ?? 1), 20));
+    }
+    response.status(201).json({ ok: true, orderId: orderResult.insertId, message: 'Pedido registrado y listo para preparación.' });
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 });
 
 app.post('/api/checkout/create-session', async (request, response) => {
