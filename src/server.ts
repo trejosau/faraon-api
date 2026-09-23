@@ -262,6 +262,41 @@ app.post('/api/orders', async (request, response) => {
   }
 });
 
+function requireAdmin(request: express.Request, response: express.Response, next: express.NextFunction): void {
+  const token = request.header('authorization')?.replace(/^Bearer\s+/i, '');
+  try {
+    const claims = token ? jwt.verify(token, jwtSecret) as { role?: string } : null;
+    if (claims?.role !== 'admin') throw new Error('ADMIN_REQUIRED');
+    next();
+  } catch {
+    response.status(401).json({ ok: false, code: 'ADMIN_REQUIRED', message: 'Necesitas una sesión de administrador.' });
+  }
+}
+
+app.get('/api/admin/orders', requireAdmin, async (_request, response) => {
+  if (!db) {
+    response.status(503).json({ ok: false, code: 'DATABASE_NOT_CONFIGURED', message: 'MySQL todavía no está configurado.' });
+    return;
+  }
+  const [rows] = await db.execute<mysql.RowDataPacket[]>('SELECT id, stripe_payment_intent_id, payment_mode, amount_mxn, status, delivery_method, shipping_zone, recipient_name, recipient_phone, address_line, city, state, postal_code, carrier, tracking_number, tracking_url, shipping_status, created_at FROM orders ORDER BY created_at DESC LIMIT 100');
+  response.json({ ok: true, orders: rows });
+});
+
+app.patch('/api/admin/orders/:id/status', requireAdmin, async (request, response) => {
+  if (!db) {
+    response.status(503).json({ ok: false, code: 'DATABASE_NOT_CONFIGURED', message: 'MySQL todavía no está configurado.' });
+    return;
+  }
+  const { status, carrier, trackingNumber, trackingUrl, shippingStatus } = request.body as { status?: string; carrier?: string; trackingNumber?: string; trackingUrl?: string; shippingStatus?: string };
+  const allowedStatuses = new Set(['pending', 'paid', 'preparing', 'shipped', 'out_for_delivery', 'delivered']);
+  if (!status || !allowedStatuses.has(status)) {
+    response.status(400).json({ ok: false, code: 'ORDER_STATUS_INVALID', message: 'Estado de pedido no válido.' });
+    return;
+  }
+  await db.execute('UPDATE orders SET status = ?, carrier = ?, tracking_number = ?, tracking_url = ?, shipping_status = ? WHERE id = ?', [status, carrier ?? null, trackingNumber ?? null, trackingUrl ?? null, shippingStatus ?? status, Number(request.params.id)]);
+  response.json({ ok: true, message: 'Pedido actualizado.' });
+});
+
 app.post('/api/checkout/create-session', async (request, response) => {
   const { paymentMode, items } = request.body as { paymentMode?: 'cash' | 'credit'; items?: Array<{ productId?: string; quantity?: number }> };
   if (!stripe) {
